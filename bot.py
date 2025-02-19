@@ -44,29 +44,45 @@ async def login(event):
     user_id = sender.id
     phone = event.pattern_match.group(1)
 
-    if user_id in user_sessions and user_sessions[user_id]["phone"] == phone:
-        await event.reply("⚠️ Anda sudah login dengan nomor ini. Tidak perlu login lagi.")
-        return
-
     session_file = os.path.join(SESSION_DIR, f'{user_id}_{phone.replace("+", "")}.session')
-    user_client = TelegramClient(session_file, api_id, api_hash)
 
-    await user_client.connect()
-
-    if not await user_client.is_user_authorized():
+    # **Cek apakah sesi sudah ada**
+    if os.path.exists(session_file):
         try:
-            await user_client.send_code_request(phone)
-            user_sessions[user_id] = {"client": user_client, "phone": phone}
-            await event.reply("✅ Kode OTP telah dikirim! Masukkan kode dengan mengetik:\n`/verify <Kode>`")
-        except errors.FloodWaitError as e:
-            await event.reply(f"⚠️ Tunggu {e.seconds} detik sebelum mencoba lagi.")
+            user_client = TelegramClient(session_file, api_id, api_hash)
+            await user_client.connect()
+
+            # **Pastikan sesi tidak terkunci**
+            if await user_client.is_user_authorized():
+                user_sessions[user_id] = {"client": user_client, "phone": phone}
+                await event.reply(f"✅ Anda sudah login sebelumnya! Langsung terhubung sebagai {phone}.")
+                await configure_event_handlers(user_client, user_id)
+                return
+            else:
+                await user_client.disconnect()  # Tutup sesi jika tidak valid
+                os.remove(session_file)  # Hapus sesi yang corrupt
+                await event.reply("⚠️ Sesi lama tidak valid, melakukan login ulang...")
+        except errors.SessionPasswordNeededError:
+            await event.reply("⚠️ Sesi ini membutuhkan password. Silakan login ulang dengan OTP.")
         except Exception as e:
-            await event.reply(f"⚠️ Gagal mengirim kode OTP: {e}")
-    else:
-        # Jika pengguna sudah login
+            await event.reply(f"⚠️ Gagal menggunakan sesi lama: {e}. Login ulang diperlukan.")
+            try:
+                await user_client.disconnect()
+            except:
+                pass
+
+    # **Jika sesi tidak ada atau terkunci, lakukan login ulang dengan OTP**
+    try:
+        user_client = TelegramClient(session_file, api_id, api_hash)
+        await user_client.connect()
+        await user_client.send_code_request(phone)
+
         user_sessions[user_id] = {"client": user_client, "phone": phone}
-        await configure_event_handlers(user_client, user_id)
-        await event.reply("✅ Akun Anda sudah aktif dan fitur diaktifkan.")
+        await event.reply("✅ Kode OTP telah dikirim! Masukkan kode dengan mengetik:\n`/verify <Kode>`")
+    except errors.FloodWaitError as e:
+        await event.reply(f"⚠️ Tunggu {e.seconds} detik sebelum mencoba lagi.")
+    except Exception as e:
+        await event.reply(f"⚠️ Gagal mengirim kode OTP: {e}")
 
 @bot_client.on(events.NewMessage(pattern='/verify (.+)'))
 async def verify(event):
@@ -84,11 +100,28 @@ async def verify(event):
     try:
         await user_client.sign_in(phone, code)
         await event.reply(f"✅ Verifikasi berhasil untuk nomor {phone}! Anda sekarang dapat menggunakan fitur.")
-
-        # Aktifkan fitur untuk sesi pengguna
         await configure_event_handlers(user_client, user_id)
     except Exception as e:
         await event.reply(f"⚠️ Gagal memverifikasi kode untuk nomor {phone}: {e}")
+
+@bot_client.on(events.NewMessage(pattern='/logout (.+)'))
+async def logout(event):
+    sender = await event.get_sender()
+    user_id = sender.id
+    phone = event.pattern_match.group(1)
+
+    session_file = os.path.join(SESSION_DIR, f'{user_id}_{phone.replace("+", "")}.session')
+
+    if user_id in user_sessions and user_sessions[user_id]['phone'] == phone:
+        user_client = user_sessions[user_id]['client']
+        await user_client.disconnect()
+        del user_sessions[user_id]
+
+    if os.path.exists(session_file):
+        os.remove(session_file)
+        await event.reply(f"✅ Berhasil logout untuk nomor {phone}.")
+    else:
+        await event.reply(f"⚠️ Tidak ada sesi aktif untuk nomor {phone}.")
 
 @bot_client.on(events.NewMessage(pattern='/help'))
 async def help_command(event):
@@ -97,14 +130,22 @@ async def help_command(event):
         "`/start` - Mulai interaksi dengan bot.\n"
         "`/login <Nomor>` - Masukkan nomor telepon Anda untuk login.\n"
         "`/verify <Kode>` - Verifikasi kode OTP.\n"
+        "`/logout <Nomor>` - Logout dari sesi yang aktif.\n"
         "`/help` - Tampilkan daftar perintah."
     )
 
-async def main():
-    # Mulai bot
-    await bot_client.start(bot_token=bot_token)
-    print("Bot berjalan!")
-    await bot_client.run_until_disconnected()
+async def run_bot():
+    while True:
+        try:
+            print("Bot berjalan!")
+            await bot_client.start(bot_token=bot_token)
+            await bot_client.run_until_disconnected()
+        except (errors.FloodWaitError, errors.RPCError) as e:
+            print(f"Telegram error: {e}. Tunggu sebelum mencoba lagi.")
+            await asyncio.sleep(5)
+        except Exception as e:
+            print(f"Error tidak terduga: {e}. Restart dalam 10 detik...")
+            await asyncio.sleep(10)
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    asyncio.run(run_bot())
